@@ -1,0 +1,62 @@
+<mujoco>
+  <statistic extent="3" center="0 0 0.5"/>
+  <option gravity="0 0 -9.81" timestep="0.001"/>
+  <visual>
+    <headlight ambient="0.35 0.35 0.35" diffuse="0.65 0.65 0.65" specular="0.2 0.2 0.2"/>
+  </visual>
+
+  <default>
+    <motor ctrllimited="true" ctrlrange="0 20"/>
+  </default>
+
+  <asset>
+    <texture type="2d" name="checker" builtin="checker" rgb1=".34 .40 .46" rgb2=".22 .27 .32" width="512" height="512"/>
+    <material name="floor_mat" texture="checker" texrepeat="5 5" texuniform="true" specular="0.15" shininess="0.2" rgba="1 1 1 1"/>
+    <mesh name="drone_cad" file="../../drone_body.stl" scale="0.001 0.001 0.001"/>
+
+  </asset>
+
+  <worldbody>
+    <light ambient=".2 .2 .2" diffuse="1 1 1" pos="0 0 3.5" dir="0 0 -1"/>
+    <light ambient=".08 .08 .08" diffuse=".55 .55 .55" pos="-2 -1 4" dir="0.35 0.2 -1"/>
+    <geom name="surface_geom" solref="0.005 1" contype="1" conaffinity="1" material="floor_mat" rgba="0.3 0.3 0.35 1" type="plane" size="3 3 0.1"/>
+
+    <body name="wall" pos="3 0 1">
+      <geom type="box" size="0.2 3 2" rgba="0.8 0.4 0.4 1" solref="0.005 1" contype="1" conaffinity="1"/>
+    </body>
+
+    <body name="drone" pos="2.65 0 0.15">
+      <joint type="free"/>
+      <site name="prop_fr" pos="0.075025 -0.100264 0.0125" zaxis="0 0 1" type="cylinder" size="0.063 0.005" rgba="0.92 0.24 0.24 0.55"/>
+      <site name="prop_fl" pos="0.075025 0.100264 0.0125" zaxis="0 0 1" type="cylinder" size="0.063 0.005" rgba="0.92 0.24 0.24 0.55"/>
+      <site name="prop_br" pos="-0.075025 -0.100264 0.0125" zaxis="0 0 1" type="cylinder" size="0.063 0.005" rgba="0.92 0.24 0.24 0.55"/>
+      <site name="prop_bl" pos="-0.075025 0.100264 0.0125" zaxis="0 0 1" type="cylinder" size="0.063 0.005" rgba="0.92 0.24 0.24 0.55"/>
+      <geom type="mesh" mesh="drone_cad" contype="0" conaffinity="0" mass="0" group="1"/>
+      <geom name="drone_body_box" type="box" size="0.095 0.0475 0.1" euler="90 0 0" mass="0.9" group="0" rgba="0.92 0.24 0.24 0.2" contype="1" conaffinity="1"/>
+      <body name="right_wheel" pos="0 -0.192 0">
+        <joint name="joint_rw" type="hinge" axis="0 1 0" damping="0.001"/>
+        <geom name="right_wheel_geom" type="cylinder" size="0.142 0.006" euler="90 0 0" mass="0.1" rgba="0 0 1 0.5" solref="0.05 2" contype="1" conaffinity="1"/>
+      </body>
+      <body name="left_wheel" pos="0 0.192 0">
+        <joint name="joint_lw" type="hinge" axis="0 1 0" damping="0.001"/>
+        <geom name="left_wheel_geom" type="cylinder" size="0.142 0.006" euler="90 0 0" mass="0.1" rgba="0 0 1 0.5" solref="0.05 2" contype="1" conaffinity="1"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor name="drone_thrust_fr" site="prop_fr" gear="0 0 1 0 0 0.02"/>
+    <motor name="drone_thrust_fl" site="prop_fl" gear="0 0 1 -0 -0 -0.02"/>
+    <motor name="drone_thrust_br" site="prop_br" gear="0 0 1 -0 -0 -0.02"/>
+    <motor name="drone_thrust_bl" site="prop_bl" gear="0 0 1 0 0 0.02"/>
+  </actuator>
+
+  <sensor>
+    <framepos name="drone_position" objtype="xbody" objname="drone"/>
+    <framelinvel name="drone_linear_velocity" objtype="xbody" objname="drone"/>
+    <frameangvel name="drone_angular_velocity" objtype="xbody" objname="drone"/>
+    <framexaxis name="drone_x_axis" objtype="xbody" objname="drone"/>
+    <frameyaxis name="drone_y_axis" objtype="xbody" objname="drone"/>
+    <framezaxis name="drone_z_axis" objtype="xbody" objname="drone"/>
+  </sensor>
+</mujoco>

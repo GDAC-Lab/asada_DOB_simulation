@@ -1,0 +1,694 @@
+function contact_test_controller_impl(varargin)
+% Run scripted scenarios that make contact logging easy to validate.
+%
+% Example:
+%   contact_test_controller
+%   contact_test_controller('hover')
+%   contact_test_controller('landing')
+%   contact_test_controller('hard_landing')
+%   contact_test_controller('ground_load')
+%   contact_test_controller('wall')
+%   contact_test_controller('wall_load')
+
+% ===== plotオプション取得 =====
+plot_enable = false;
+
+if any(strcmp(varargin, 'plot_enable'))
+    idx = find(strcmp(varargin, 'plot_enable'), 1);
+
+    plot_enable = varargin{idx+1};
+
+    %引数から削除
+    varargin(idx:idx+1) = [];
+end
+
+close all; clc;
+
+% ===== 入力解析 =====
+[scenario_name, runtime_options] = parse_inputs(varargin{:});
+project_directory = fileparts(fileparts(fileparts(mfilename('fullpath'))));
+controller_session = controller_shared.initialize_controller_session( ...
+    project_directory, ...
+    runtime_options, ...
+    'simulator_root', resolve_runtime_path_option(runtime_options.simulator_root, project_directory), ...
+    'params_path', resolve_runtime_path_option(runtime_options.params_path, fullfile(project_directory, 'vehicle_params.json')), ...
+    'generated_xml_directory', resolve_runtime_path_option(runtime_options.generated_xml_directory, fullfile(project_directory, 'build', 'generated_xml')) ...
+);
+
+vehicle_params = controller_session.vehicle_params;
+instance_options = controller_session.instance_options;
+controller_socket = controller_session.controller_socket;
+socket_cleanup_handler = onCleanup(@() controller_shared.cleanup_controller_socket(controller_socket)); %#ok<NASGU>
+simulator_cleanup_handler = onCleanup(@() controller_shared.cleanup_simulator_process(controller_session.simulator_process_id, controller_session.simulator_options)); %#ok<NASGU>
+
+controller_config = controller_shared.build_controller_config(vehicle_params);
+[allocation_matrix, mixer] = controller_shared.build_allocation_and_mixer(vehicle_params);
+command_options = controller_shared.build_command_options(vehicle_params.command_mode, vehicle_params.thrust_coefficient, 'fidelity_mode', vehicle_params.fidelity.mode);
+runtime_metrics = controller_shared.initialize_runtime_metrics();
+
+% ===== シナリオ構築 =====
+scenario = build_test_scenario(scenario_name);
+% % ===== シナリオ別 初期状態調整 =====
+% if strcmp(scenario.name, 'wallrunning')
+% 
+%     % 壁位置
+%     wall_x = 3.0;
+% 
+%     % 車輪半径
+%     wheel_r = 0.142;
+% 
+%     % 壁接触位置に補正
+%     x_init = wall_x - 0.2 - wheel_r;
+% 
+%     % 初期位置を書き換え
+%     scenario.initial_position = [x_init; 0; 0.3];
+% 
+%     % ピッチ角15°（x軸回転クォータニオン）
+%     theta = deg2rad(15);
+%     scenario.initial_quat = [cos(theta/2); sin(theta/2); 0; 0];
+% 
+% end
+
+% if exist('scenario','var') && isfield(scenario, 'initial_position')
+%     controller_shared.send_initial_state(controller_socket, ...
+%         scenario.initial_position, scenario.initial_quat);
+% end
+
+logging_options = build_logging_options(scenario, instance_options);
+logger = simulation_logger(project_directory, build_logging_config( ...
+    vehicle_params, controller_config, scenario.waypoints(end, 2:4)', allocation_matrix, mixer, scenario, command_options, instance_options ...
+), logging_options);
+% cleanup_handler = onCleanup(@() controller_shared.finalize_controller_run(logger)); %#ok<NASGU>
+%生のログ，ほしくなったらCtrl+T
+
+status_display_interval = 1.0;
+next_status_time = 0.0;
+scenario_start_time = NaN;
+idle_deadline = tic;
+
+fprintf('Starting contact test scenario: %s (%s, recv=%d, send=%d)\n', ...
+    scenario.name, ...
+    instance_options.label, ...
+    instance_options.controller_local_port, ...
+    instance_options.simulator_receive_port ...
+);
+controller_shared.display_logging_behavior(logger);
+
+%実験条件
+Ld = 50;
+zx = 0;
+dt = 0.001; % JSONのtimestepと合わせる
+
+lx = 0.35;
+ly = 0.28;
+a  = 0.005;   % ヨー用係数（適当でOK）
+
+% A = [
+%    -lx   lx    lx   -lx;
+%    -ly   ly   -ly    ly;
+%    -a   -a     a     a;
+%     1     1     1     1
+% ];
+
+A = [
+     ly   ly  -ly  -ly;   % roll
+    -lx   lx   lx  -lx;   % pitch
+    -a    a   -a    a;    % yaw
+     1    1    1    1
+];
+
+
+Ainv = inv(A);
+
+
+%データ配列の整理
+ux_log = [];
+Fhat_log = [];
+lambda_hat_log = [];
+lambda_true_log = [];
+time_log = [];
+
+pitch_log = [];
+
+try
+    while true
+        state = controller_shared.read_latest_state(controller_socket);
+        % disp(fieldnames(state)) %デバッグ用（変数確認）
+        if isempty(state)
+            if toc(idle_deadline) >= runtime_options.state_timeout_seconds
+                runtime_metrics = controller_shared.note_timeout(runtime_metrics);
+                error('No simulator state received within %.1f s.', runtime_options.state_timeout_seconds);
+            end
+            continue;
+        end
+
+        idle_deadline = tic;
+
+        if isnan(scenario_start_time)
+            scenario_start_time = double(state.time);
+        end
+
+        scenario_time = double(state.time) - scenario_start_time;
+        if scenario_time > scenario.duration_seconds
+            fprintf('Scenario complete at t=%.2f s\n', scenario_time);
+            break;
+        end
+
+%         if strcmp(scenario.name, 'wallrunning') && scenario_time < 0.01
+%     state.position(1) = 2.65;
+% end
+
+        target_position = interpolate_waypoints(scenario.waypoints, scenario_time);
+        compute_timer = tic;
+        % rotor_thrusts = controller_shared.compute_hover_control( ...
+        %     state, ...
+        %     target_position, ...
+        %     controller_config.desired_heading, ...
+        %     vehicle_params.mass, ...
+        %     vehicle_params.gravity, ...
+        %     controller_config.position_gain, ...
+        %     controller_config.velocity_gain, ...
+        %     controller_config.attitude_gain, ...
+        %     controller_config.angular_velocity_gain, ...
+        %     mixer, ...
+        %     vehicle_params.max_rotor_thrust ...
+        % );
+
+%%%自作推力%%%       
+% ===== 状態 =====
+pos = double(state.position(:));
+vel = double(state.velocity(:));
+
+% ===== 誤差 =====
+e_p = target_position - pos;
+e_v = -vel;
+
+% ===== ゲイン =====
+k_p = 3;
+k_d = 2;
+
+% ===== 加速度指令 =====
+a_des = k_p * e_p + k_d * e_v;
+
+% ===== 重力補償 =====
+a_des(3) = a_des(3) + vehicle_params.gravity;
+
+% % ===== 推力ベクトル =====
+% F_des = vehicle_params.mass * a_des;
+
+% ===== z軸に投影 =====
+R = reshape(double(state.rotation_matrix), 3, 3);
+z_axis = R(:,3);
+
+% thrust = max(dot(F_des, z_axis), 0); %thrustが負にならないように工夫
+
+% ===== z方向のみ制御 =====
+z = pos(3);
+vz = vel(3);
+z_des = target_position(3);
+
+kz_p = 5;
+kz_d = 3;
+
+az = kz_p*(z_des - z) + kz_d*(-vz) + vehicle_params.gravity;
+
+thrust = vehicle_params.mass * az;
+
+% ✅ 上限と下限
+thrust = max(thrust, 0);
+thrust = min(thrust, 2.5 * vehicle_params.mass * vehicle_params.gravity);
+
+% thrust = max(thrust, 0.8 * vehicle_params.mass * vehicle_params.gravity);
+% thrust = min(thrust, 2.5 * vehicle_params.mass * vehicle_params.gravity);
+
+
+if strcmp(scenario.name, 'wallrunning')
+    scale = min(scenario_time / 2.0, 1);
+    thrust = thrust * (1 + 0.5 * scale);
+end
+
+
+% if vz < 0
+%     thrust = thrust * 1.2;
+% end
+
+
+
+
+
+% ===== 壁面走行（回転行列ベース姿勢制御）=====
+if strcmp(scenario.name, 'wallrunning')
+
+    % ===== 回転行列 & 角速度 =====
+    R = reshape(double(state.rotation_matrix), 3, 3);
+    Omega = double(state.angular_velocity_body(:));
+
+    % ===== 目標姿勢（ピッチ15°，他は0）=====
+roll_deg  = 0;
+pitch_deg = 15;
+yaw_deg   = 0;
+
+
+R_d = rotz(yaw_deg) * roty(pitch_deg) * rotx(roll_deg);
+
+    % ===== 姿勢誤差（重要）=====
+    e_R_mat = 0.5 * (R_d' * R - R' * R_d);
+    e_R = [
+        e_R_mat(3,2);
+        e_R_mat(1,3);
+        e_R_mat(2,1)
+    ];
+
+    % ===== 角速度誤差 =====
+    e_Omega = Omega;
+
+    % ===== ゲイン（mlx流用）=====
+
+
+k_tau_p = [
+    3     0   0;
+    0     2   0;
+    0     0   0.001
+];
+
+
+k_tau_d = [
+    4.0   0   0;
+    0     3.0 0;
+    0     0   0.05
+];
+
+
+
+% k_tau_p = [
+%     8   0   0;
+%     0   20  0;
+%     0   0   2
+% ];
+% 
+% k_tau_d = [
+%     3   0   0;
+%     0   3   0;
+%     0   0   1
+% ];
+
+
+    % ===== トルク =====
+    tau = -k_tau_p * e_R - k_tau_d * e_Omega;
+tau(1) = max(min(tau(1), 0.02), -0.02);
+tau(2) = max(min(tau(2), 0.02), -0.02);
+tau(3) = max(min(tau(3), 0.008), -0.008);
+
+
+
+
+
+    % % ===== ローター反映 =====
+    % rotor_thrusts(1) = rotor_thrusts(1) + tau(2);
+    % rotor_thrusts(2) = rotor_thrusts(2) - tau(2);
+    % rotor_thrusts(3) = rotor_thrusts(3) - tau(2);
+    % rotor_thrusts(4) = rotor_thrusts(4) + tau(2);
+
+% ===== tau（すでに計算済み）=====
+tau_vec = [
+    tau(1);
+    tau(2);
+    tau(3);
+    thrust
+];
+% % ===== ミキサ =====
+rotor_thrusts = Ainv * tau_vec;
+% ===== 制限 =====
+rotor_thrusts = max(rotor_thrusts, 0);
+rotor_thrusts = min(rotor_thrusts, vehicle_params.max_rotor_thrust);
+disp(rotor_thrusts')
+
+% % rotor_thrusts = ones(4,1) * (thrust/4);
+
+
+
+
+end
+
+% ===== DOBのためのux計算 =====
+R = reshape(double(state.rotation_matrix), 3, 3);
+z_axis = R(:, 3);% body z軸は回転行列の第3列
+total_thrust = sum(rotor_thrusts);
+force_world = total_thrust * z_axis;
+
+% 壁法線方向（WORLDのx軸）
+ux = force_world(1);
+target_position(1) = 2.63; %目標位置を少し壁の内側にして接触力を発生させる
+% ux_bias = 5.0;  % 5Nくらい
+% ux = ux + ux_bias;
+
+% ===== DOB =====
+zxdot = -Ld*zx - Ld*ux;
+zx = zx + dt*zxdot;
+
+Fhat = zx;
+lambda_hat = -Fhat;
+
+%接触状態の確認
+vx = state.velocity(1);
+
+%真の接触力
+lambda_true = state.contact_summary.max_normal_force;
+
+
+        runtime_metrics = controller_shared.update_runtime_metrics(runtime_metrics, state, toc(compute_timer) * 1.0e3);
+
+        control_command = controller_shared.build_control_command( ...
+            rotor_thrusts, ...
+            command_options, ...
+            'sequence', runtime_metrics.command_sequence, ...
+            'source_state_sequence', runtime_metrics.last_source_state_sequence, ...
+            'wall_time_send_ns', controller_shared.wall_time_now_ns(), ...
+            'controller_compute_ms', runtime_metrics.last_controller_compute_ms, ...
+            'state_age_ms', runtime_metrics.last_state_age_ms, ...
+            'state_sequence_gap', runtime_metrics.last_state_sequence_gap, ...
+            'fidelity_mode', vehicle_params.fidelity.mode ...
+        );
+        controller_shared.send_control_command(controller_socket, control_command, controller_session.target_ip, controller_session.target_port);
+        % logger.append(state, control_command, target_position, ...
+        % 'ux', ux, ...
+        % 'Fhat', Fhat, ...
+        % 'lambda_hat', lambda_hat);
+
+        if state.time >= next_status_time
+            display_status(state, target_position, control_command, command_options, scenario.name, scenario_time, instance_options.label);
+            next_status_time = state.time + status_display_interval;
+        end
+
+        %ループでログとり
+        ux_log(end+1) = ux;
+        Fhat_log(end+1) = Fhat;
+        lambda_hat_log(end+1) = lambda_hat;
+        lambda_true_log(end+1) = lambda_true;
+        time_log(end+1) = state.time;
+
+
+pitch = atan2(z_axis(1), z_axis(3));
+pitch_deg = rad2deg(pitch);
+
+pitch_log(end+1) = pitch_deg;
+
+
+
+
+
+    end
+catch execution_error
+    fprintf('\nScenario controller stopped: %s\n', execution_error.message);
+end
+
+
+% ===== グラフ描画 =====
+if plot_enable
+
+    % ===== logsフォルダ作成 =====
+    log_root = fullfile(pwd, 'logs');
+    if ~exist(log_root, 'dir')
+        mkdir(log_root);
+    end
+
+    timestamp = datestr(now, 'yyyymmdd_HHMMSS');
+    log_dir = fullfile(log_root, [scenario.name '_' timestamp]);
+    mkdir(log_dir);
+
+    % ===== mat保存 =====
+    save(fullfile(log_dir, 'dob_log.mat'), ...
+        'ux_log', 'Fhat_log', 'lambda_hat_log', 'lambda_true_log', 'time_log');
+
+    disp("Plotting graphs...");
+
+    % --- 接触力 ---
+    fig1 = figure;
+    plot(time_log, lambda_true_log, 'b', 'LineWidth', 2); hold on
+    plot(time_log, lambda_hat_log, 'r--', 'LineWidth', 2);
+    legend('lambda true','lambda hat')
+    title('接触力[N]')
+    grid on
+    xlim([0 max(time_log)])
+
+    saveas(fig1, fullfile(log_dir, 'contact_force.png'));
+
+    % --- 不確かさ ---
+    d = lambda_true_log - ux_log;
+
+    fig2 = figure;
+    plot(time_log, d, 'LineWidth', 2)
+    title('推定誤差')
+    grid on
+    xlim([0 max(time_log)])
+
+    saveas(fig2, fullfile(log_dir, 'uncertainty.png'));
+
+    % --- DOB確認 ---
+    fig3 = figure;
+    plot(time_log, ux_log, 'b', 'LineWidth', 2); hold on
+    plot(time_log, -Fhat_log, 'r--', 'LineWidth', 2);
+    legend('ux','-Fhat')
+    title('DOBの推定値')
+    grid on
+    xlim([0 max(time_log)])
+
+    saveas(fig3, fullfile(log_dir, 'dob_check.png'));
+
+    % --- ピッチ角 ---
+    fig4 = figure;
+    plot(time_log, pitch_log, 'LineWidth', 2)
+    title('ピッチ角 [deg]')
+    grid on
+    xlim([0 max(time_log)])
+    
+    saveas(fig4, fullfile(log_dir, 'pitch_angle.png'));
+
+
+    disp("Plots saved!");
+
+end
+end
+
+function scenario = build_test_scenario(scenario_name)
+switch scenario_name
+    case 'hover'
+        scenario = struct( ...
+            'name', 'hover', ...
+            'duration_seconds', 8.0, ...
+            'waypoints', [ ...
+                0.0, 0.0, 0.0, 1.5; ...
+                8.0, 0.0, 0.0, 1.5 ...
+            ] ...
+        );
+    case 'landing'
+        scenario = struct( ...
+            'name', 'landing', ...
+            'duration_seconds', 18.0, ...
+            'waypoints', [ ...
+                0.0, 0.0, 0.0, 1.5; ...
+                2.0, 0.0, 0.0, 1.5; ...
+                8.0, 0.0, 0.0, 0.14; ...
+                12.0, 0.0, 0.0, 0.14; ...
+                16.0, 0.0, 0.0, 1.0; ...
+                18.0, 0.0, 0.0, 1.0 ...
+            ] ...
+        );
+    case 'hard_landing'
+        scenario = struct( ...
+            'name', 'hard_landing', ...
+            'duration_seconds', 8.0, ...
+            'waypoints', [ ...
+                0.0, 0.0, 0.0, 1.5; ...
+                2.0, 0.0, 0.0, 1.5; ...
+                2.1, 0.0, 0.0, 0.05; ...
+                8.0, 0.0, 0.0, 0.05 ...
+            ] ...
+        );
+    case 'ground_load'
+        scenario = struct( ...
+            'name', 'ground_load', ...
+            'duration_seconds', 18.0, ...
+            'waypoints', [ ...
+                0.0, 0.0, 0.0, 1.5; ...
+                2.0, 0.0, 0.0, 1.5; ...
+                8.0, 0.0, 0.0, 0.10; ...
+                10.0, 0.0, 0.0, -0.05; ...
+                16.0, 0.0, 0.0, -0.05; ...
+                18.0, 0.0, 0.0, -0.05 ...
+            ] ...
+        );
+    case 'wall'
+        scenario = struct( ...
+            'name', 'wall', ...
+            'duration_seconds', 12.0, ...
+            'waypoints', [ ...
+                0.0, 0.0, 0.0, 1.5; ...
+                2.0, 0.0, 0.0, 1.5; ...
+                8.0, 2.75, 0.0, 1.5; ...
+                12.0, 2.75, 0.0, 1.5 ...
+            ] ...
+        );
+    case 'wall_load'
+        scenario = struct( ...
+            'name', 'wall_load', ...
+            'duration_seconds', 18.0, ...
+            'waypoints', [ ...
+                0.0, 0.0, 0.0, 1.5; ...
+                2.0, 0.0, 0.0, 1.5; ...
+                8.0, 2.80, 0.0, 1.5; ...
+                10.0, 3.10, 0.0, 1.5; ...
+                16.0, 3.10, 0.0, 1.5; ...
+                18.0, 3.10, 0.0, 1.5 ...
+            ] ...
+        );
+
+    case 'wall_slide'
+        scenario = struct( ...
+            'name', 'wall_slide', ...
+            'duration_seconds', 15.0, ...
+            'waypoints', [ ...
+                0.0, 0.0, 0.0, 1.5;    % ホバリング
+                2.0, 0.0, 0.0, 1.5;    % 安定
+                6.0, 2.9, 0.0, 1.5;   % 壁に接触
+                9.0, 2.9, 0.0, 2.5;   % 上に移動
+                12.0, 2.9, 0.0, 0.5;  % 下に移動
+                15.0, 2.9, 0.0, 1.5   % 中央戻る
+            ] ...
+        );
+
+
+case 'wallrunning'
+    scenario.name = 'wallrunning';
+    scenario.duration_seconds = 16;
+
+    scenario.waypoints = [
+        0.0   2.63 0 0.15;   % ←壁の一番下（重要）
+        2.0   2.63 0 0.15;   % 安定化
+        5.0   2.63 0 1.5;    % 上
+        8.0   2.63 0 0.15;   % 下
+        11.0  2.63 0 1.5;    % 上
+        14.0  2.63 0 0.15;   % 下
+        16.0  2.63 0 0.15;
+    ];
+
+
+    otherwise
+        error('Unsupported scenario: %s', scenario_name);
+end
+end
+
+
+function target_position = interpolate_waypoints(waypoints, scenario_time)
+if scenario_time <= waypoints(1, 1)
+    target_position = waypoints(1, 2:4)';
+    return;
+end
+
+if scenario_time >= waypoints(end, 1)
+    target_position = waypoints(end, 2:4)';
+    return;
+end
+
+for waypoint_index = 1:(size(waypoints, 1) - 1)
+    start_waypoint = waypoints(waypoint_index, :);
+    end_waypoint = waypoints(waypoint_index + 1, :);
+    if scenario_time < end_waypoint(1)
+        interval = end_waypoint(1) - start_waypoint(1);
+        alpha = (scenario_time - start_waypoint(1)) / interval;
+        target_position = ((1.0 - alpha) * start_waypoint(2:4) + alpha * end_waypoint(2:4))';
+        return;
+    end
+end
+
+target_position = waypoints(end, 2:4)';
+end
+
+
+function display_status(state, target_position, control_command, command_options, scenario_name, scenario_time, instance_label)
+position = reshape(double(state.position), [], 1);
+position_error = target_position - position;
+contact_count = controller_shared.get_contact_summary_field(state, 'count');
+max_normal_force = controller_shared.get_contact_summary_field(state, 'max_normal_force');
+command_values = controller_shared.displayed_command_values(control_command, command_options);
+realtime_factor = controller_shared.get_realtime_factor(state);
+fprintf( ...
+    '[%s %s t=%.2f s, rtf=%.2f] pos=[%.3f %.3f %.3f] m, target=[%.3f %.3f %.3f] m, err=[%.3f %.3f %.3f] m, contacts=%d, maxFn=%.3f, cmd=%s [%.3f %.3f %.3f %.3f] %s\n', ...
+    scenario_name, ...
+    instance_label, ...
+    scenario_time, ...
+    realtime_factor, ...
+    position(1), position(2), position(3), ...
+    target_position(1), target_position(2), target_position(3), ...
+    position_error(1), position_error(2), position_error(3), ...
+    contact_count, ...
+    max_normal_force, ...
+    command_options.input_mode, ...
+    command_values(1), command_values(2), command_values(3), command_values(4), ...
+    controller_shared.command_unit_label(command_options.input_mode) ...
+);
+end
+
+
+function config = build_logging_config(vehicle_params, controller_config, target_position, allocation_matrix, mixer, scenario, command_options, instance_options)
+config = controller_shared.build_base_logger_config(vehicle_params, controller_config, allocation_matrix, mixer, command_options, instance_options);
+config.target_position = target_position;
+config.scenario = scenario;
+end
+
+
+function logging_options = build_logging_options(scenario, instance_options)
+logging_options = struct( ...
+    'save_mode', 'finalize', ...
+    'periodic_interval_seconds', 30.0, ...
+    'print_save_events', true, ...
+    'directory_name', 'logs', ...
+    'file_prefix', ['contact_test_' scenario.name instance_options.file_suffix] ...
+);
+end
+
+
+function [scenario_name, runtime_options] = parse_inputs(varargin)
+scenario_name = 'landing';
+parse_start_index = 1;
+if ~isempty(varargin)
+    first_argument = varargin{1};
+    if ischar(first_argument) || (isstring(first_argument) && isscalar(first_argument))
+        scenario_name = char(first_argument);
+        parse_start_index = 2;
+    end
+end
+
+parser = inputParser;
+addParameter(parser, 'instance_id', 0, @(value) validateattributes(value, {'numeric'}, {'scalar', 'integer', 'nonnegative'}));
+addParameter(parser, 'wait_for_startup_seconds', 3.0, @(value) validateattributes(value, {'numeric'}, {'scalar', 'positive'}));
+addParameter(parser, 'state_timeout_seconds', inf, @(value) (isnumeric(value) && isscalar(value) && value > 0) || isinf(value));
+addParameter(parser, 'headless', false, @(value) islogical(value) || (isnumeric(value) && isscalar(value)));
+addParameter(parser, 'simulation_duration_seconds', NaN, @(value) (isnumeric(value) && isscalar(value)) || isempty(value));
+addParameter(parser, 'auto_launch', false, @(value) islogical(value) || (isnumeric(value) && isscalar(value)));
+addParameter(parser, 'shutdown_on_exit', false, @(value) islogical(value) || (isnumeric(value) && isscalar(value)));
+addParameter(parser, 'simulator_root', '', @(value) ischar(value) || (isstring(value) && isscalar(value)));
+addParameter(parser, 'params_path', '', @(value) ischar(value) || (isstring(value) && isscalar(value)));
+addParameter(parser, 'generated_xml_directory', '', @(value) ischar(value) || (isstring(value) && isscalar(value)));
+parse(parser, varargin{parse_start_index:end});
+
+runtime_options = parser.Results;
+runtime_options.instance_id = double(runtime_options.instance_id);
+runtime_options.wait_for_startup_seconds = double(runtime_options.wait_for_startup_seconds);
+runtime_options.state_timeout_seconds = double(runtime_options.state_timeout_seconds);
+runtime_options.headless = logical(runtime_options.headless);
+runtime_options.simulation_duration_seconds = double(runtime_options.simulation_duration_seconds);
+runtime_options.auto_launch = logical(runtime_options.auto_launch);
+runtime_options.shutdown_on_exit = logical(runtime_options.shutdown_on_exit);
+runtime_options.simulator_root = char(runtime_options.simulator_root);
+runtime_options.params_path = char(runtime_options.params_path);
+runtime_options.generated_xml_directory = char(runtime_options.generated_xml_directory);
+end
+
+
+function path_value = resolve_runtime_path_option(path_value, default_value)
+if isempty(path_value)
+    path_value = default_value;
+end
+path_value = char(path_value);
+end
