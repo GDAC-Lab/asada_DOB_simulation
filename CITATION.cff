@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+title: "mujoco-wheeled-uav-simulator"
+type: software
+authors:
+  - name: "mujoco-wheeled-uav-simulator contributors"
+abstract: "MuJoCo-based simulator for a wheel-equipped quadrotor with Python and MATLAB control workflows."
+license: "MIT"
+keywords:
+  - MuJoCo
+  - UAV
+  - quadrotor
+  - simulator
+  - MATLAB
+  - Python
+version: "0.1.0"
+repository-artifact: "./"
+preferred-citation:
+  type: generic
+  title: "Related paper or project page for mujoco-wheeled-uav-simulator"
+  authors:
+    - name: "mujoco-wheeled-uav-simulator contributors"
+  notes: "Replace this entry with the final paper, preprint, or project-page citation once publication details are available."
